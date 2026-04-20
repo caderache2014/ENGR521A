@@ -1,0 +1,541 @@
+LIV Neural ODE — Julia/SciML Implementation
+============================================
+ENGR521 Project | Billingham | April 2026
+
+STATUS: Multi-shot training running. Single-shot evaluation producing
+meaningful results. MAPE comparison vs Romero baseline in progress.
+
+------------------------------------------------------------------------
+WHAT THIS IS
+------------------------------------------------------------------------
+Julia implementation of the RomeroNNV hybrid neural ODE from:
+
+  Wang, Garnier & Rea. "Hybridizing physics and neural ODEs for
+  predicting plasma inductance dynamics in tokamak fusion reactors."
+  arXiv:2310.20079v1, 2023.
+
+The model replaces the approximate third equation in Romero (2010)'s
+3-state lumped-parameter ODE with a neural network residual correction,
+while keeping the two exact physics equations intact. The three states
+are Li (internal inductance), Ip (plasma current), and V (loop voltage
+at the equilibrium flux surface). Vind (inductive voltage from the
+external coils) is a control input, not a state — it is provided as a
+cubic spline interpolant built from each shot's data.
+
+------------------------------------------------------------------------
+DATA
+------------------------------------------------------------------------
+Dataset: romero_shots_489
+  - 489 plasma discharge shot files from Alcator C-Mod (MIT)
+  - Shared by Allen Wang (MIT PSFC) — permission for academic team
+    use pending written confirmation
+  - Each shot: ~26-46 timesteps at ~0.02s intervals
+  - Key columns: time, li, ip_MA, vc_minus_vb, Vind
+
+Data is NOT in this repo. Contact Billingham for access.
+
+------------------------------------------------------------------------
+IMPLEMENTATION
+------------------------------------------------------------------------
+Language: Julia 1.x
+Key packages:
+  DifferentialEquations.jl / OrdinaryDiffEq.jl  — ODE solves
+  Lux.jl                                         — neural network
+  DiffEqFlux.jl                                  — multiple shooting
+  SciMLSensitivity.jl (InterpolatingAdjoint)     — adjoint gradients
+  Optimization.jl + OptimizationOptimisers.jl    — AdamW optimizer
+  Dierckx.jl                                     — Vind splines
+  ComponentArrays.jl / Flux (destructure only)   — parameter handling
+
+Neural network architecture (RomeroNNV):
+  Input:  [Li, Ip, V, Vind]  (4 features)
+  Hidden: Dense(4→32, softplus) → Dense(32→32, softplus)
+  Output: Dense(32→1, tanh)   — bounded residual correction to dV/dt
+  Parameters: 1249 total
+
+ODE right-hand side:
+  du[1] = (-2*Vind - 2*V) / (liip_norm * |Ip|)   # exact Romero
+  du[2] = ( 2*Vind +   V) / (liip_norm * |Li|)   # exact Romero
+  du[3] = -V/τ + (κ/τ)*Vind + NN(Li,Ip,V,Vind)  # Romero + NN residual
+
+Physics constants: κ=0.98, τ=1.25 (from Romero 2010)
+Normalization: liip_norm = max(|Ip|) × max(|Li|) across all 489 shots
+               = 3.6559 (MA × dimensionless)
+
+
+------------------------------------------------------------------------
+WHY WE BUILD A SPLINE FROM Vind — CONTROLS VS STATES
+------------------------------------------------------------------------
+The LIV system has two types of variables that play fundamentally
+different roles in the ODE.
+
+STATES are the variables the ODE integrates forward in time:
+  Li, Ip, and V. The solver starts from initial conditions at t=0
+  and advances the state vector step by step. At each step it calls
+  the right-hand side function to compute dLi/dt, dIp/dt, and dV/dt,
+  then uses those derivatives to update the states. The neural network
+  learns to correct dV/dt. States are what we predict and compare
+  against measured data in the loss function.
+
+CONTROLS are external inputs that drive the system but are not
+  predicted by the model. Vind (the inductive voltage from the
+  external poloidal field coils) is a control — it is set by the
+  tokamak operator and measured directly. The ODE needs to evaluate
+  Vind at every internal timestep the solver takes, including steps
+  between the measured data points.
+
+THE PROBLEM: The ODE solver (Tsit5) is adaptive — it takes timesteps
+  of varying size determined by the error tolerance, not by the
+  spacing of the experimental data. Our Vind measurements exist only
+  at ~28-46 discrete times per shot. The solver may need to evaluate
+  Vind hundreds of times per shot at arbitrary intermediate times.
+
+THE SOLUTION: We fit a cubic spline to the measured (time, Vind)
+  pairs for each shot before training begins. The spline is a smooth
+  C2-continuous function t → Vind(t) that passes through all measured
+  points and can be evaluated at any time in the shot duration. When
+  the ODE solver queries Vind at an arbitrary t, it calls the spline
+  instead of interpolating the raw data.
+
+  spl_s = Spline1D(t_shot, Vind_shot; k=3, bc="extrapolate")
+  Vind(t) = spl_s(t)   # callable at any t
+
+WHY NOT SPLINE Li, Ip, OR V? If we splined the states and fed them
+  into the ODE right-hand side, we would be giving the solver the
+  measured answer at each step. The ODE would have no reason to learn
+  anything — it would just read out the ground truth. This is called
+  "teacher forcing" and it prevents the model from learning real
+  dynamics. States must be integrated freely from initial conditions
+  so that training errors propagate back through the ODE and teach
+  the network to correct its behavior.
+
+  In short: spline the control (Vind) because we need it continuously.
+  Do not spline the states (Li, Ip, V) because learning them is the
+  entire point.
+
+WHY CUBIC SPLINE SPECIFICALLY? Cubic splines are C2-continuous —
+  their first and second derivatives are smooth. This matters for the
+  adjoint sensitivity method (InterpolatingAdjoint) we use to compute
+  gradients during training. Noisy or discontinuous control signals
+  produce noisy gradients, which destabilize training. The spline
+  acts as a denoising and smoothing step as well as an interpolant.
+
+ONE SPLINE PER SHOT: Each of the 489 shots has its own Vind time
+  series and its own time axis. We precompute all 489 splines before
+  training begins and store them in a dictionary keyed by shot ID.
+  Inside the loss function, the appropriate spline is looked up for
+  each shot. The spline evaluation is wrapped in Zygote.ignore() to
+  prevent the automatic differentiation system from trying to
+  differentiate through the spline's underlying C library calls,
+  which it cannot do.
+
+------------------------------------------------------------------------
+MULTIPLE SHOOTING — WHY AND HOW
+------------------------------------------------------------------------
+BACKGROUND: THE NAIVE APPROACH AND WHY IT FAILS
+
+The simplest way to train a neural ODE is "single shooting": start
+from the initial conditions at t=0, integrate forward to the end of
+the shot, compare the predicted trajectory to the measured data, and
+backpropagate the error. This works well on short, smooth trajectories
+but fails badly on longer ones for two reasons.
+
+First, small errors in the neural network accumulate over time. A
+slightly wrong dV/dt at t=0.1s produces a slightly wrong V at t=0.2s,
+which feeds back into dLi/dt and dIp/dt, which compounds the error
+further. By t=0.4s the predicted trajectory may be wildly wrong, even
+if the network is approximately correct everywhere. The loss landscape
+seen by the optimizer becomes extremely nonlinear and hard to navigate.
+
+Second, the adjoint gradient computation must integrate *backwards*
+through the entire shot duration. Long integrations accumulate
+floating point errors in both the forward and backward passes,
+producing noisy or vanishing gradients. This is the "exploding/
+vanishing gradient" problem in ODE form.
+
+Wang et al. address both problems using multiple shooting, which is
+standard practice in scientific machine learning for neural ODEs.
+
+WHAT MULTIPLE SHOOTING DOES
+
+Multiple shooting divides each shot's time axis into short overlapping
+segments called groups. For a shot with 28 timesteps and a group size
+of 5, you get roughly 6-7 segments. Each segment is solved as an
+independent short ODE starting from fresh initial conditions at the
+beginning of that segment.
+
+  Segment 1: t[1]  → t[5],  starting from u[t=1]  (measured)
+  Segment 2: t[5]  → t[9],  starting from u[t=5]  (measured)
+  Segment 3: t[9]  → t[13], starting from u[t=9]  (measured)
+  ...and so on.
+
+Each segment is short enough that errors don't compound badly.
+Gradients flow back only through the short segment, not the entire
+shot, making them cleaner and more informative. The loss is computed
+on each segment independently and summed.
+
+THE CONTINUITY TERM
+
+There is a problem with dividing the trajectory into independent
+segments: the predicted state at the end of segment 1 may not match
+the measured initial condition used to start segment 2. If you just
+ignore this mismatch, the network may learn a solution that fits each
+segment individually but produces a discontinuous overall trajectory
+that is physically nonsensical.
+
+The continuity term is a penalty added to the loss that penalizes
+the gap between the predicted end state of one segment and the
+measured start state of the next:
+
+  continuity_loss = continuity_term × sum of |pred_end[i] - data_start[i+1]|
+
+A continuity_term of 0 means segments are completely independent —
+the network only needs to fit the data within each segment.
+A continuity_term of 10 (as was tried early in this project) means
+the continuity penalty dominates and the optimizer spends most of
+its effort matching segment endpoints rather than fitting the physics.
+We found continuity_term = 0 works best for this problem because
+the measured data already provides the start of each segment.
+
+GROUP SIZE
+
+Group size controls how many timesteps are in each segment. It is
+a tradeoff:
+
+  Small group size (e.g. 3-4 timesteps):
+    + Shorter integration, cleaner gradients
+    + More segments, more loss terms per shot
+    - Each segment contains very little trajectory information
+    - Network can fit short segments with almost any weights
+
+  Large group size (e.g. 10-15 timesteps):
+    + Each segment contains more trajectory information
+    + Stronger constraint on the learned dynamics
+    - Longer integration, noisier gradients
+    - Approaches single-shooting as group_size → len(shot)
+
+Wang et al. use a group size of approximately 5 timesteps, which
+balances gradient quality against trajectory information. In our
+current multi-shot training loop we have moved away from the
+DiffEqFlux multiple_shoot() function (which caused Zygote
+compatibility issues with our per-shot splines) and instead solve
+each shot as a single full-length integration. This is closer to
+single shooting per shot, but because each shot is only 26-46
+timesteps and we warm-start from measured initial conditions per
+shot, the gradient quality is acceptable. If training stalls on
+harder shots, reverting to explicit segment-wise multiple shooting
+within each shot is the natural next step.
+
+RELATION TO WANG'S IMPLEMENTATION
+
+Wang implements multiple shooting in JAX using a custom scan-based
+approach. The key architectural choice we share is that each shot
+in the multi-shot training batch starts from its own measured initial
+conditions — we do not chain shots together. This means the network
+must learn dynamics that generalize across all initial conditions in
+the training set, not just those in a single long trajectory. This
+is precisely why training on 100 diverse shots (our current setting)
+is far more informative than training on 1 shot for 100x as long.
+
+
+------------------------------------------------------------------------
+THE HUBER LOSS FUNCTION — WHY IT MATTERS HERE
+------------------------------------------------------------------------
+WHAT IS HUBER LOSS?
+
+Most people default to mean squared error (MSE) as a loss function.
+MSE penalizes errors as the square of their magnitude. This means a
+prediction that is 10x wrong contributes 100x as much to the loss as
+a prediction that is 1x wrong. Large errors dominate the gradient and
+the optimizer fixates on fixing outliers at the expense of the bulk
+of the data.
+
+Huber loss is a hybrid. For small errors (below a threshold δ) it
+behaves like MSE — quadratic, smooth, well-behaved gradients. For
+large errors (above δ) it switches to linear penalty, like mean
+absolute error (MAE). The result is a loss function that is:
+
+  - Differentiable everywhere (unlike pure MAE, which has a
+    non-differentiable kink at zero)
+  - Robust to outliers (unlike MSE, which lets outliers dominate)
+  - Sensitive to small errors (unlike MAE, which treats all errors
+    equally regardless of sign or magnitude)
+
+In formula form, for a scalar residual r and threshold δ:
+
+  L(r) = 0.5 * r²/δ         if |r| ≤ δ   (quadratic region)
+  L(r) = |r| - 0.5*δ        if |r| > δ   (linear region)
+
+Our implementation uses relative errors (normalized by the true
+value) before applying the Huber function, so the threshold δ=0.1
+means "treat errors below 10% of the true value quadratically,
+and errors above 10% linearly."
+
+WHY IT SUITS THIS PROBLEM
+
+The C-Mod dataset is experimental plasma data. It is noisy. Some
+shots have measurement artifacts, aggressive transients near the
+end of the discharge, or sudden events (like the -2.34 V spike at
+the last timestep of shot 1050218005) that no smooth ODE model
+should be expected to reproduce exactly. These are genuine outliers
+in the training data.
+
+With MSE loss, those outlier timesteps — particularly the violent
+rampdown endpoints — would produce enormous gradients that swamp
+the signal from the well-behaved portions of the trajectory. The
+network would spend most of its capacity trying to fit the last
+few timesteps of the hardest shots, at the expense of learning
+the general physics that applies across all shots.
+
+Huber loss caps the influence of those outlier timesteps. The
+network learns from the full trajectory without being hijacked
+by the hardest points.
+
+WHY ALLEN LIKELY CHOSE IT — AND WHETHER IT WAS CRITICAL
+
+Wang almost certainly chose Huber loss for the same reasons: he
+was working with real experimental data from a fusion reactor,
+which is inherently noisy and contains transient events. This is
+a standard choice in any physics-ML paper dealing with experimental
+time series rather than clean simulation data.
+
+Was it critically beneficial? Probably yes for the MlpODE model,
+less so for RomeroNNV. Here is the reasoning:
+
+MlpODE asks a pure neural network to learn all three equations from
+scratch. With no physics prior, the network is much more vulnerable
+to being misled by outlier timesteps — it has no fallback of
+"the physics says this should look like X." Huber loss's robustness
+to outliers is therefore more important for MlpODE.
+
+RomeroNNV only asks the network to learn a residual correction to
+the third equation. The exact Romero equations for du[1] and du[2]
+already constrain the solution strongly. Even with MSE loss,
+RomeroNNV would likely be more stable than MlpODE because the
+physics does most of the work. Huber loss is still beneficial —
+it improves training stability and the quality of the learned
+residual — but it is probably not the difference between success
+and failure for RomeroNNV the way it may be for MlpODE.
+
+This is actually a testable hypothesis within our project: if we
+retrain MlpODE with MSE loss instead of Huber, we would expect
+noticeably worse performance, while the same switch on RomeroNNV
+would have a smaller effect.
+
+------------------------------------------------------------------------
+OPTIMIZER CHOICE — AdamW WITH EXPONENTIAL LEARNING RATE DECAY
+------------------------------------------------------------------------
+WHAT IS AdamW?
+
+Adam (Adaptive Moment Estimation) is the de facto standard optimizer
+for training neural networks. It maintains a running estimate of both
+the first moment (mean gradient) and second moment (uncentered
+variance of gradient) for each parameter. It uses these estimates to
+adaptively scale the learning rate per parameter — parameters with
+consistently large gradients get smaller effective learning rates,
+and parameters with small or noisy gradients get larger ones. This
+makes Adam much more robust than plain stochastic gradient descent
+on problems where gradients vary widely in scale across parameters,
+which is typical of neural ODEs where some parameters affect the
+loss strongly and others barely at all.
+
+AdamW is a corrected variant of Adam that fixes a subtle bug in how
+Adam handles weight decay (L2 regularization). In the original Adam,
+weight decay is folded into the gradient before the adaptive scaling,
+which means the decay is applied unevenly across parameters. AdamW
+decouples weight decay from the gradient update entirely, applying
+it directly to the parameters after the gradient step:
+
+  θ ← θ - η * adam_step(∇L) - λ * θ
+
+where λ is the weight decay coefficient. This produces better
+regularization behavior — it penalizes large weights uniformly
+regardless of gradient magnitude.
+
+Wang's configuration:
+  optimizer = optax.adamw(learning_rate=schedule)
+  where schedule = optax.exponential_decay(1e-3, 50, 0.9, end_value=2.5e-4)
+
+Our Julia equivalent:
+  OptimizationOptimisers.AdamW(0.001f0, (0.9f0, 0.999f0), 1f-4)
+
+WHY WEIGHT DECAY FOR THIS PROBLEM?
+
+Neural ODEs are prone to a specific failure mode: the network learns
+large-magnitude weights that produce a correction term that perfectly
+fits the training shots but generalizes poorly to held-out shots.
+This is standard overfitting, but it is especially dangerous in ODEs
+because large weights tend to produce stiff equations — the ODE
+solver takes tiny timesteps to maintain accuracy, training slows
+dramatically, and in extreme cases the ODE becomes numerically
+unstable.
+
+Weight decay keeps the network weights small, which has two benefits:
+  1. It regularizes against overfitting across shots
+  2. It keeps the NN correction term bounded, which keeps the ODE
+     well-conditioned and numerically stable
+
+This is directly related to why we also initialize the final layer
+near zero. Both choices — near-zero initialization and weight decay
+— are pushing in the same direction: start close to the Romero
+baseline and only deviate from it when the data strongly demands it.
+
+WHY AN EXPONENTIALLY DECAYING LEARNING RATE?
+
+The exponential schedule Wang uses starts at η=1e-3 and decays by
+a factor of 0.9 every 50 iterations, with a floor of η=2.5e-4:
+
+  η(step) = max(1e-3 × 0.9^(step/50), 2.5e-4)
+
+This reflects a well-understood pattern in neural network training:
+
+Early training (high learning rate): The network is far from any
+  good solution. Large steps are beneficial — they allow the
+  optimizer to traverse the loss landscape quickly and escape flat
+  regions or shallow local minima. Using a small learning rate
+  early means taking many small steps in the wrong direction before
+  finding the right basin.
+
+Late training (low learning rate): The network is near a good
+  solution. Large steps are harmful — they overshoot the minimum
+  and cause the loss to oscillate rather than converge. A small
+  learning rate allows fine-grained refinement of the parameters.
+
+The decay rate of 0.9 every 50 steps is relatively slow — it takes
+about 650 steps to halve the learning rate. This is intentional for
+neural ODEs, where gradients are computed via adjoint integration
+and are inherently noisier than standard backpropagation gradients.
+A slower decay gives the optimizer more time at each learning rate
+level to extract signal from noisy gradients before stepping down.
+
+The floor of 2.5e-4 (one-quarter of the initial rate) prevents the
+learning rate from decaying to near-zero before training is complete.
+Without a floor, exponential decay eventually makes the optimizer
+nearly stationary, which looks like convergence even if the model
+has not actually converged.
+
+WHY THIS MATTERS SPECIFICALLY FOR NEURAL ODEs
+
+Standard neural network training computes gradients by backpropagating
+through a fixed computational graph. The graph is the same every
+iteration. Neural ODE gradients are computed by solving an adjoint
+ODE backwards in time — the computational "graph" changes every
+iteration because the forward ODE trajectory changes as the network
+weights change. This means the gradient noise level is not constant
+during training: early in training, when the network is far from a
+good solution, the ODE trajectory is chaotic and adjoint gradients
+are especially noisy. Later in training, when the trajectory is more
+stable, gradients are cleaner.
+
+The exponential decay schedule is well-matched to this dynamic.
+The high early learning rate is robust to the noisy early gradients —
+large steps are taken but the direction changes enough that the
+optimizer still makes progress on average. The lower late learning
+rate exploits the cleaner late-training gradients for precise
+convergence. A fixed learning rate would require choosing between
+"large enough to make early progress" and "small enough to converge
+cleanly" — the schedule sidesteps this tradeoff entirely.
+
+NOTE ON OUR CURRENT IMPLEMENTATION
+
+Our current Julia implementation uses AdamW with a fixed learning
+rate of 1e-3 rather than the full exponential decay schedule. The
+decay schedule requires either a custom training loop or the
+ParameterSchedulers.jl package, which adds complexity. The fixed
+AdamW is a reasonable approximation — the weight decay provides
+the regularization benefit, and the fixed rate produces acceptable
+results. Implementing the full schedule is a natural next step if
+training quality needs improvement.
+
+------------------------------------------------------------------------
+TRAINING
+------------------------------------------------------------------------
+Current configuration (v49):
+  N_shots: 100 (first 100 shots by DataFrame order)
+  Optimizer: AdamW(lr=0.001, β=(0.9,0.999), λ=1e-4)
+  maxiters: 3000
+  Loss: mean Huber loss on Li and Ip predictions across all shots
+        (relative errors, δ=0.1)
+  Sensealg: InterpolatingAdjoint(ZygoteVJP)
+
+Key Zygote compatibility constraints:
+  - All shot data (DataFrames) precomputed into plain Julia Dicts
+    before the loss function — DataFrames not differentiable
+  - Vind splines precomputed per shot outside the loss function
+  - Spline evaluation wrapped in Zygote.ignore() inside ODE RHS
+  - Near-zero initialization of final NN layer (scale factor 0.01)
+
+Training loss plateau: ~0.175 after 3000 iterations
+  - Believed to be near-irreducible for this shot set with current
+    architecture — Romero already fits most gentle shots well
+
+------------------------------------------------------------------------
+CURRENT RESULTS (v48/v49, preliminary)
+------------------------------------------------------------------------
+Evaluated on 10 shots where pure Romero is Float64-stable:
+
+  Romero Li MAPE:  8.575%
+  Romero Ip MAPE: 10.223%
+  NN     Li MAPE:  5.511%   (36% relative improvement)
+  NN     Ip MAPE:  9.023%   (12% relative improvement)
+
+90/100 training shots excluded from MAPE because pure Romero (Float32)
+goes numerically unstable on aggressive rampdown shots — consistent
+with Wang's motivation for replacing the Romero V-dot equation.
+v49 switches Romero evaluation to Float64 to recover more shots.
+
+------------------------------------------------------------------------
+KNOWN ISSUES / NEXT STEPS
+------------------------------------------------------------------------
+1. MAPE currently computed on only 10/100 shots — v49 switches
+   Romero MAPE evaluation to Float64 to include all stable shots
+
+2. Need held-out test set for proper generalization evaluation
+   (currently evaluating on training shots only)
+
+3. Need to scale to all 489 shots for training, not just 100
+
+4. After training converges: generate regular-grid V-dot dataset
+   for symbolic regression (SymbolicRegression.jl) and export
+   CSV for Phil's PySINDy analysis
+
+5. Compare results against Wang Table 1 once full training complete
+
+------------------------------------------------------------------------
+FILE STRUCTURE
+------------------------------------------------------------------------
+src/
+  LIV_CMod_version1_v49.jl   — current working script
+  romero_shots_489/           — data directory (not in repo)
+
+Output files (generated on run, not in repo):
+  predictions_v49.csv         — 3-way comparison: data/Romero/NN
+  predictions_hard_shot_v49.csv  — hard shot evaluation
+  li_comparison_v49.png       — Li plot
+  ip_comparison_v49.png       — Ip plot
+  V_comparison_v49.png        — V plot
+
+------------------------------------------------------------------------
+HOW TO RUN
+------------------------------------------------------------------------
+1. Install Julia and activate the wang_model_workspace project:
+     cd wang_model_workspace
+     julia --project=.
+
+2. In Julia REPL:
+     include("src/LIV_CMod_version1_v49.jl")
+
+3. Data must be present at:
+     src/romero_shots_489/
+
+Runtime: ~10-15 minutes for 3000 iterations on 100 shots (CPU only)
+
+------------------------------------------------------------------------
+REFERENCES
+------------------------------------------------------------------------
+1. Romero J et al. Plasma internal inductance dynamics in a tokamak.
+   Nuclear Fusion, 50(11):115002, 2010.
+
+2. Wang AM, DT Garnier, C Rea. Hybridizing physics and neural ODEs
+   for predicting plasma inductance dynamics in tokamak fusion reactors.
+   arXiv:2310.20079v1, 2023.
