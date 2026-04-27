@@ -1,0 +1,98 @@
+LIV_Cmod_RomeroNN_v62 — Status and Open Questions
+Christopher Billingham, 26 April 2026
+
+WHAT THIS SCRIPT IS
+-------------------
+A Julia/SciML reproduction of Wang, Garnier & Rea (2023), "Hybridizing
+Physics and Neural ODEs for Predicting Plasma Inductance Dynamics in
+Tokamak Fusion Reactors" (NeurIPS Climate Change AI workshop). Their
+RomeroNNV model: keep the two exact equations of Romero (2010) for
+dLi/dt and dIp/dt, replace the third (V-dot) equation with a neural
+network. Trained on 489 plasma discharges from MIT's Alcator C-Mod.
+
+The reference implementation is in JAX/Equinox (Allen Wang shared a
+code snippet). This script is a clean-room port to Julia/SciML.
+
+WHERE WE ARE (v61, 1500 AdamW iterations with Wang's exponential LR decay)
+--------------------------------------------------------------------------
+  TEST split (74 shots, never seen during training):
+    Romero baseline Li MAPE:   8.36% +/- 3.37%
+    Romero baseline Ip MAPE:  14.38% +/- 5.45%
+    Trained NN     Li MAPE:    7.35% +/- 3.86%
+    Trained NN     Ip MAPE:   13.82% +/- 5.52%
+
+  Wang's reported numbers (his Table 1, test split):
+    RomeroNNV Li MAPE:  3.50% +/- 3.70%
+    RomeroNNV Ip MAPE:  1.97% +/- 1.90%
+
+  We're roughly 2x off on Li and 7x off on Ip. The Ip gap is the puzzle.
+
+WHAT WE'VE TRIED (v55 -> v61)
+-----------------------------
+  v55: Implemented 70/15/15 train/val/test split, seed=42 (matches Wang).
+  v56: Added validation-loss reporting and best-val checkpointing.
+  v57: Added multi-shooting with segment_length=10 (matches Wang).
+  v58: Tried unbounded NN output (matches Wang's identity output) ->
+       43% of shots failed numerically. Reverted.
+  v59: Bounded output to +/-5 via scaled tanh. Stable across all shots.
+  v60: Trained for 1500 iterations instead of 500. Modest gains.
+  v61: Implemented Wang's exponential LR decay 1e-3 -> 2.5e-4 (chunked-
+       solve approximation). Modest gains.
+
+  Each version moved Ip MAPE by ~0.5-1.5 percentage points. The
+  cumulative improvement across all hyperparameter tuning is ~1.5 pp.
+  Closing the remaining gap looks structural, not compute-limited.
+
+OPEN QUESTIONS (THINGS WE CAN'T SETTLE WITHOUT WANG'S HELP)
+-----------------------------------------------------------
+1. NORMALIZATION. Wang's RomeroNNV uses a quantity called `romero_norm`
+   in his denominators. In his code it's a hard-coded machine constant
+   from MachineConstants.for_cmod(). Our `liip_norm` is computed as
+   max(|Ip|) * max(|Li|) over the dataset, ~3.66 in our scale.
+   We do not know what value Wang's `romero_norm` actually evaluates
+   to, and the difference could systematically shift NN gradients.
+
+2. DATA PREPROCESSING. Wang's pipeline calls li_ip_pp.preprocess() on
+   a pickle file before any training. The 489 CSVs Allen shared with
+   us may be pre- or post-preprocessing -- we don't know. If post,
+   we're fine. If pre, our training data differs from his evaluation
+   data in subtle ways (filtering, smoothing, time-base alignment).
+
+3. LOSS NORMALIZATION. Wang's LiIpLoss does jnp.sum(huber_loss(...))
+   without per-shot or per-segment averaging. Our loss_multishot
+   averages per segment then per epoch. For Huber the optima are
+   identical, but effective gradient magnitudes differ. Probably
+   minor but unverified.
+
+4. NN OUTPUT BOUNDING. Wang uses unbounded MLP output (eqx.nn.MLP
+   with no output activation). We had to bound to +/-5 after seeing
+   solver instability with unbounded output (v58). It's possible Wang
+   has a stability mechanism we're missing -- gradient clipping, weight
+   decay, or something embedded in his Trainer class we don't have
+   visibility into.
+
+5. SHOT 1050218005 V-NN ARTIFACT. On our diagnostic shot, V_nn drifts
+   smoothly to +0.6 by end-of-shot while real V drops to -2.34. Real V
+   oscillates wildly; ours doesn't. This is the kind of behavior that
+   would make Ip wrong because V appears in dIp/dt, but we can't tell
+   if Wang's model has the same issue or not -- his paper only shows
+   one example shot.
+
+NEXT STEPS BEING CONSIDERED
+---------------------------
+  A. Email Wang directly with these questions.
+  B. Implement MlpODE (replace ALL three equations with a NN) in
+     Julia. If MlpODE is also ~7x off Wang's MlpODE numbers, the gap
+     is systematic across both architectures and probably about data
+     or normalization, not RomeroNNV-specific bugs.
+  C. v63: clean up section ordering (diagnostic blocks belong at
+     bottom of script, not interleaved).
+
+CONFIRMED SAFE TO IGNORE
+------------------------
+  Sign of dV/dt term: corrected at v54. Verified directly against
+    Romero 2010 eq. (45) and Wang's RomeroModel class.
+  Train/val/test isolation: verified, training never sees val/test
+    shot IDs.
+  Solver stability: 0% failure rate since v59.
+  LR schedule: verified live via per-chunk LR prints.
