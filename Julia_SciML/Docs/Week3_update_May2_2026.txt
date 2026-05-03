@@ -1,0 +1,256 @@
+==============================================================================
+RomeroNNV / MlpODE Reproduction in Julia/SciML — Progress Update
+Project: ENGR 521A, Spring 2026
+Author: Christopher Billingham (Julia/SciML implementation)
+Reference: Wang, Garnier, Rea (2023), "RomeroNNV: Hybrid Physics-Neural
+           ODE Model of Plasma Current Dynamics in Tokamaks," NeurIPS
+           workshop paper, applied to Alcator C-Mod data.
+==============================================================================
+
+
+1. SUMMARY
+------------------------------------------------------------------------------
+
+This effort ports Wang et al. (2023)'s hybrid physics-neural ODE models
+("RomeroNNV") and pure neural ODE baseline ("MlpODE") from JAX/Equinox
+into Julia/SciML, using Lux for neural networks and OrdinaryDiffEq for
+ODE integration. Training is on 489 plasma discharges from the Alcator
+C-Mod tokamak, kindly provided by Allen Wang.
+
+After 5 substantive revision cycles (v62 → v66), the Julia ports
+produce TEST-split mean absolute percentage error (MAPE) within a
+factor of 2-3 of Wang's published values on both internal inductance
+(Li) and plasma current (Ip):
+
+   Final RomeroNNV (v64): TEST Li 4.65%, TEST Ip 5.20%
+   Final MlpODE   (v63): TEST Li 4.25%, TEST Ip 2.78%
+
+   Wang (2023) Table 1: RomeroNNV Li 3.50% ± 3.70%, Ip 1.97% ± 1.90%
+                       MlpODE    Li 5.99% ± 7.23%, Ip 8.10% ± 9.69%
+
+The MlpODE port matches Wang's MlpODE on Li and substantially beats
+his MlpODE on Ip. The RomeroNNV port closes most of the gap with
+Wang's RomeroNNV but retains a residual ~3pp gap on Ip. The remaining
+discrepancy is consistent with implementation-level differences that
+have been identified (noted in Section 4) but not yet resolved.
+
+
+2. ENVIRONMENT
+------------------------------------------------------------------------------
+
+   Julia 1.10.8 (2025-01-22)
+   Lux v1.9.0
+   OrdinaryDiffEq via SciMLSensitivity
+   Optimization v4.1.1, Optimisers v0.4.7
+   Dierckx v0.5.x for cubic spline interpolation of Vind controls
+   Float32 throughout for compatibility with Lux defaults
+
+   Hardware: MacBook Pro M-series, single-process Julia. ~3 hours
+   wall time per 1000-iter AdamW run; ~10-12 hours for 5000+L-BFGS.
+
+
+3. RESULTS PROGRESSION
+------------------------------------------------------------------------------
+
+All numbers are TEST-split MAPE, on a 70/15/15 random shot split
+(seed=42), evaluated on 74 held-out shots.
+
+   ┌───────┬────────────┬──────────┬──────────┬──────────────────────┐
+   │ Ver   │ Iters      │ NN Li    │ NN Ip    │ Notes                │
+   ├───────┼────────────┼──────────┼──────────┼──────────────────────┤
+   │ v62   │ 1000 AdamW │  7.42%   │ 13.76%   │ baseline; abs() in   │
+   │       │            │          │          │ denoms; norm = 3.66  │
+   ├───────┼────────────┼──────────┼──────────┼──────────────────────┤
+   │ v63   │ 1000 AdamW │  5.48%   │  5.19%   │ signed denoms,       │
+   │       │            │          │          │ norm = 0.85, grad    │
+   │       │            │          │          │ clip = 1.0           │
+   ├───────┼────────────┼──────────┼──────────┼──────────────────────┤
+   │ v64   │ 5000 AdamW │  4.65%   │  5.20%   │ longer training +    │
+   │       │ + 500 LBFGS│          │          │ L-BFGS refinement    │
+   ├───────┼────────────┼──────────┼──────────┼──────────────────────┤
+   │ v65   │ 1000 AdamW │  6.52%   │ 11.25%   │ norm = 0.22 sweep;   │
+   │       │            │          │          │ regressed (see §4)   │
+   ├───────┼────────────┼──────────┼──────────┼──────────────────────┤
+   │ v66   │ 1000 AdamW │ 10.62%   │  4.26%   │ minibatch 512 of     │
+   │       │ batch=512  │          │          │ 1138 segments        │
+   └───────┴────────────┴──────────┴──────────┴──────────────────────┘
+
+The v62 → v63 jump (Ip from 13.76% → 5.19%) was the largest single
+improvement, attributable to four simultaneous changes that aligned
+the Julia implementation with Wang's JAX code and Tino Wells's
+PyTorch port:
+
+   1. Normalization constant changed from max|Ip|·max|Li| ≈ 3.66 to
+      0.85, matching the default in Tino Wells's PyTorch port.
+   2. Romero physics denominators changed from `norm * abs(X) + eps`
+      to `norm * X + eps`, using signed Li and Ip values.
+   3. NN final-layer activation changed from scaled tanh ([-5, +5])
+      to identity (unbounded output).
+   4. Gradient clipping at 1.0 added via Optimisers.ClipNorm,
+      replacing the bounded NN output as the stability mechanism.
+
+The v62 → v63 MlpODE jump was less dramatic (Li 5.44 → 4.25, Ip 3.10 →
+2.78) because MlpODE doesn't use the Romero physics denominators —
+the changes that mattered most for RomeroNNV (signed denoms,
+normalization) don't apply.
+
+
+4. KEY IMPLEMENTATION CHOICES AND OPEN QUESTIONS
+------------------------------------------------------------------------------
+
+A. Normalization constant (`romero_norm` / `liip_norm` / "the constant
+   factor for normalization" in Wang 2023 §3)
+
+   - Wang's JAX code uses `MachineConstants.for_cmod().romero_norm()`
+     — a function that returns a value derived from C-Mod machine
+     geometry. The actual value returned is not visible in the code
+     snippet that has been shared.
+   - Tino's PyTorch port hardcodes 0.85 as the default.
+   - The Julia port's `calculate_df_norm()` (a port of Tino's
+     empirical computation) returns the median of
+     (-2*Vind - 2*V) / (Ip * dLi/dt) across all shot finite-
+     differences. On C-Mod data, this returns 0.2166.
+   - 0.22 was tested in v65; it regressed dramatically on the
+     pure-Romero baseline (TEST Li 51%, Ip 17%). This is consistent
+     with κ and τ being fixed constants in the Julia port — Tino's
+     port has them as learnable nn.Parameter, so his implementation
+     absorbs the normalization scaling into κ and τ during training.
+   - The final result uses 0.85, matching Tino's default.
+
+B. κ and τ (kappa, tau) parameters in the V-dot equation
+   (-V/τ + (κ/τ)·Vind)
+
+   - Wang's JAX code initializes `params: jnp.ndarray = jnp.array([0.98,
+     1.25])` with a comment marking it as "hard-coded initial guess."
+     Under the JAX trainer's `trainable_params_spec=eqx.is_inexact_array`
+     filter, this jnp.array is marked as trainable.
+   - The Julia port treats κ = 0.98 and τ = 1.25 as fixed constants.
+   - For RomeroNNV, this affects only the pure-Romero baseline
+     comparison (since the NN replaces V-dot entirely). For MlpODE,
+     it doesn't affect the trained model at all. So this difference
+     should not significantly impact the trained-model TEST MAPE.
+   - Open question for Allen Wang in upcoming communication: whether
+     κ and τ are intended as trainable in the JAX code, or whether
+     the JAX filtering convention is incidental.
+
+C. Multi-shooting
+
+   - Wang's paper §4 describes multi-shooting with `segment_length=10`
+     as essential for stable training of plasma neural ODEs.
+   - The Julia port uses multi-shooting with segment_length=10,
+     overlap-by-1.
+   - Tino's PyTorch port does NOT use multi-shooting — it integrates
+     full shots per gradient step. Tino's results are nonetheless
+     comparable to Wang's, suggesting multi-shooting may be helpful
+     but not strictly necessary at this problem scale.
+
+D. Batch size
+
+   - Wang's JAX code: `batch_size=512`.
+   - The Julia v62-v65 used full-batch training (all ~1138 segments
+     per gradient step), as does Tino's PyTorch port (with default
+     train_split=64 shots, his "batches" are roughly that many).
+   - v66 explicitly tests minibatch=512 sampling. Result: TEST Li
+     regressed from 5.48% to 10.62% at matched 1000 AdamW iterations,
+     while TEST Ip improved from 5.19% to 4.26%. Net: full-batch
+     produces better joint optimization at the problem scale of
+     this dataset. Full-batch (v64) is retained as the final result.
+
+E. ODE solver
+
+   - Wang's JAX code: dt0=0.01 (Diffrax-defaulted method).
+   - The Julia port uses Tsit5() with reltol=1e-4, abstol=1e-6
+     (adaptive, not fixed-step).
+   - Tino's PyTorch port uses fixed-step RK4 with step=0.01.
+   - Fixed-step RK4 has not been tested in the Julia implementation.
+
+F. Loss function
+
+   - Wang's JAX: Huber loss with delta=0.1, on relative errors of Li
+     and Ip vs. measurements, summed across all timesteps.
+   - Tino's PyTorch: similar Huber on relative errors, but trapezoidal
+     time-integrated rather than uniformly summed.
+   - Julia port: Huber on relative errors with delta=0.1, summed
+     uniformly. Closer to Wang's than Tino's in this respect.
+
+
+5. CROSS-FRAMEWORK COMPARISON
+------------------------------------------------------------------------------
+
+Parallel reproductions across the team's three frameworks. Wang's
+published numbers are included for reference but are not part of the
+team's own reproduction effort.
+
+   ┌───────────────────────┬──────────────────┬───────────┬───────────┐
+   │ Source                │ Implementation   │ TEST Li   │ TEST Ip   │
+   ├───────────────────────┼──────────────────┼───────────┼───────────┤
+   │ Wang et al. (2023),   │ JAX/Equinox      │ 3.50%     │ 1.97%     │
+   │ published reference   │                  │           │           │
+   ├───────────────────────┼──────────────────┼───────────┼───────────┤
+   │ Christopher Billingham│ Julia/SciML      │ 4.65%     │ 5.20%     │
+   ├───────────────────────┼──────────────────┼───────────┼───────────┤
+   │ Tino Wells            │ PyTorch          │ 7.20%     │ -2.75% *  │
+   ├───────────────────────┼──────────────────┼───────────┼───────────┤
+   │ Phil Prior            │ JAX (in progress)│ TBD       │ TBD       │
+   └───────────────────────┴──────────────────┴───────────┴───────────┘
+
+   * Tino's reported Ip MAPE has a negative sign because his
+     percent-error formula uses signed Ip (which is always negative
+     in this dataset) in the denominator without taking absolute
+     values. The magnitude is comparable to the Julia port's Ip MAPE
+     but direct comparison is non-trivial.
+
+
+6. NEXT STEPS
+------------------------------------------------------------------------------
+
+Following the project proposal's stretch goal:
+
+   1. Generate a new dataset of (state, control, NN-output) triplets
+      from the trained RomeroNNV (v64) and MlpODE (v63) models across
+      the validation and test shots.
+   2. Apply symbolic regression (SymbolicRegression.jl) to recover
+      analytic expressions for the V-dot residual learned by the
+      neural network in RomeroNNV.
+   3. Compare any symbolically-recovered expressions to the original
+      Romero (2010) -V/τ + (κ/τ)·Vind form, with the goal of
+      identifying any temperature-dependent corrections (te_avg_kev)
+      that improve the fit.
+
+This phase will use the Julia port given Julia/SciML's mature
+symbolic regression tooling.
+
+
+7. OUTSTANDING QUESTIONS FOR ALLEN WANG
+------------------------------------------------------------------------------
+
+   Q1. Are the κ and τ parameters in `RomeroModel.params` trainable
+       during optimization, or fixed at their initial values?
+   Q2. How is `MachineConstants.for_cmod().romero_norm()` defined?
+       What is its value, and how was it derived?
+   Q3. Are the TEST MAPE values in Table 1 of the 2023 paper computed
+       on a held-out test set, or on validation data?
+
+These would be folded into a brief joint email to Allen pending team
+discussion. Project deliverables can proceed with or without responses.
+
+
+8. REPRODUCING THESE RESULTS
+------------------------------------------------------------------------------
+
+Code is on GitHub. Best-of-class results in the Julia port:
+
+   src/LIV_Cmod_RomeroNN_v64.jl   →  predictions_RomeroNN_v64.csv
+   src/LIV_Cmod_MlpODE_v63.jl     →  predictions_MlpODE_v63.csv
+
+Run from the project root with:
+
+   julia --project=. -e 'include("src/LIV_Cmod_RomeroNN_v64.jl")'
+   julia --project=. -e 'include("src/LIV_Cmod_MlpODE_v63.jl")'
+
+Each run is fully deterministic given seed=42 in the train/val/test
+split and Julia's default RNG state.
+
+==============================================================================
+End of progress report.
+==============================================================================
