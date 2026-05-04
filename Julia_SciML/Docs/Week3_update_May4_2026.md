@@ -23,7 +23,7 @@ Wang's published TEST MAPE values (Table 1):
 | Wang RomeroNNV (paper) | 3.50% ± 3.70% | 1.97% ± 1.90% | Reference target |
 | Wang MlpODE (paper) | 5.99% ± 7.23% | 8.10% ± 9.69% | Reference target |
 | Julia RomeroNN v68 | 4.62% ± 2.75% | 5.17% ± 1.99% | 7500 AdamW + 500 L-BFGS, full-shot MAPE |
-| Julia MlpODE v68 | TBD | TBD | Running |
+| Julia MlpODE v68 | 4.25% ± 2.68% | 2.78% ± 2.54% | 7500 AdamW + 500 L-BFGS, full-shot MAPE |
 | PyTorch RomeroNNV (Tino) | 7.20% | -2.75%* | 256 epochs, 64 train shots; signed denominator |
 | JAX RomeroNNV (Phil) | 4.02% ± 3.15% | 2.42% ± 1.33% | 3000 epochs, per-segment endpoint MAPE |
 
@@ -135,3 +135,23 @@ Phil's V_dot plot (NN output uncorrelated with finite-difference) is consistent 
 - Agree on questions for Wang and finalize email.
 - Agree on equation discovery direction (SR vs SINDy, RomeroNNV vs MlpODE).
 - Document team-wide methodology in a shared written reference (this README or a follow-up).
+
+## X. MlpODE outperforms RomeroNN — an unexpected result
+
+The Julia MlpODE v68 results are notable on two fronts:
+
+**1. Julia MlpODE substantially beats Wang's reported MlpODE.**
+Wang's MlpODE: Li 5.99% ± 7.23%, Ip 8.10% ± 9.69%.
+Julia MlpODE v68: Li 4.25% ± 2.68%, Ip 2.78% ± 2.54%.
+
+This is a 1.7pp improvement on Li and a 5.3pp improvement on Ip relative to Wang's published numbers. Possible explanations include differences in training duration (we ran 7500 AdamW + 500 L-BFGS), use of multi-shooting, or hyperparameter choices. A direct comparison of training setups would clarify this — see questions for Wang in §4.
+
+**2. Julia MlpODE outperforms Julia RomeroNN on Ip.**
+Within our Julia implementations, MlpODE achieves Ip MAPE of 2.78% versus RomeroNN's 5.17% — a 2.4pp gap favoring the pure-NN model over the physics-NN hybrid. This is the *opposite* of the ordering in Wang's Table 1, where RomeroNNV beats MlpODE on Ip (1.97% vs 8.10%).
+
+A working hypothesis: our RomeroNN uses fixed Romero (2010) coefficients (κ=0.98, τ=1.25) that may not be optimal for C-Mod data. MlpODE has no such constraint and is free to learn whatever Li/Ip dynamics best fit the data. If the fixed physics coefficients are slightly wrong for this dataset, RomeroNN inherits a small handicap that MlpODE doesn't.
+
+This hypothesis is testable. Tino's PyTorch implementation treats κ and τ as learnable; Phil's JAX implementation uses learnable α scaling factors instead of κ/τ. If the fixed-coefficient hypothesis is right, the implementations with trainable physics parameters should not show the same MlpODE-beats-RomeroNN ordering. Comparison across implementations would be informative once methodologies are aligned.
+
+**Implications for the project's equation-discovery phase.**
+This finding strengthens the case for performing symbolic regression on the trained MlpODE rather than on the trained RomeroNN V channel. MlpODE's NN learns Li and Ip dynamics directly under loss supervision, and our results show those learned dynamics are accurate. SR on those channels could either rediscover Romero-like physics (a positive validation of Romero's framework) or reveal that something different from Romero better fits this data (a more interesting finding). See §6 for the equation-discovery decision tree.
