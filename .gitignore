@@ -1,3 +1,18 @@
 
 *.pkl
 .DS_Store
+
+# Julia environment artifacts
+gr-temp/
+*.log
+
+# Large derivatives CSVs (keep summaries; regenerable from scripts)
+**/derivatives_*.csv
+
+# Per-point and per-shot diagnostic outputs (large; regenerable)
+**/vdot_diagnostic_perpoint_*.csv
+**/vdot_diagnostic_pershot_*.csv
+**/vdot_pathological_shots_*.csv
+
+# Local IDE / OS files
+.DS_Store
